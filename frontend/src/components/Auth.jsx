@@ -23,7 +23,10 @@ export default function Auth({
       password
     }) : await supabase.auth.signUp({
       email,
-      password
+      password,
+      options: {
+        emailRedirectTo: `${window.location.origin}/`
+      }
     });
     setBusy(false);
     if (authError) return setError(authError.message);
@@ -39,12 +42,12 @@ export default function Auth({
       <div className="auth-symbol">
         <BookOpen size={25} />
       </div>
-      <div className="eyebrow muted">WELCOME TO POSTLIGHT</div>
+      <div className="eyebrow muted">WELCOME TO SMART RESRVE</div>
       <h2>
         {mode === 'signin' ? 'Good to have you back.' : 'Make yourself at home.'}
       </h2>
       <p>
-        {mode === 'signin' ? 'Sign in to share your stories and explore with AI.' : 'Create an account to write and explore.'}
+        {mode === 'signin' ? 'Sign in to manage your facility bookings.' : 'Create an account to reserve college facilities.'}
       </p>
       <form onSubmit={submit}>
         <label>Email address<input type="email" value={email} onChange={event => setEmail(event.target.value)} placeholder="you@example.com" required /></label>

@@ -1,48 +1,128 @@
-create extension if not exists vector with schema extensions;
 
-create table if not exists public.posts (
+-- SMART RESERVE DATABASE SCHEMA
+-- College facility booking system
+
+create extension if not exists btree_gist with schema extensions;
+
+-- 1. Facilities: rooms, courts and other bookable spaces
+create table public.facilities (
   id uuid primary key default gen_random_uuid(),
-  author_id uuid not null references auth.users(id) on delete cascade,
+  name text not null,
+  description text,
+  location text,
+  capacity integer check (capacity is null or capacity > 0),
+  is_active boolean not null default true,
+  created_at timestamptz not null default now()
+);
+
+-- 2. Bookings
+create table public.bookings (
+  id uuid primary key default gen_random_uuid(),
+  facility_id uuid not null references public.facilities(id),
+  user_id uuid not null references auth.users(id) on delete cascade,
   title text not null check (char_length(title) between 1 and 160),
-  body text not null check (char_length(body) between 1 and 20000),
-  image_path text,
+  purpose text,
+  start_time timestamptz not null,
+  end_time timestamptz not null,
+  status text not null default 'confirmed'
+    check (status in ('confirmed', 'cancelled')),
   created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
+  cancelled_at timestamptz,
+  check (end_time > start_time)
 );
 
-create table if not exists public.post_chunks (
-  id bigserial primary key,
-  post_id uuid not null references public.posts(id) on delete cascade,
-  chunk_index integer not null,
-  content text not null,
-  embedding extensions.vector(768) not null,
-  unique (post_id, chunk_index)
+-- Prevent overlapping active bookings for the same facility.
+-- This also protects against two people booking simultaneously.
+alter table public.bookings
+  add constraint bookings_no_overlap
+  exclude using gist (
+    facility_id with =,
+    tstzrange(start_time, end_time, '[)') with &&
+  )
+  where (status = 'confirmed');
+
+create index bookings_user_id_idx on public.bookings (user_id);
+create index bookings_facility_start_idx
+  on public.bookings (facility_id, start_time);
+
+-- 3. Waitlist: users waiting for a facility and time slot
+create table public.waitlist (
+  id uuid primary key default gen_random_uuid(),
+  facility_id uuid not null references public.facilities(id),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  title text not null,
+  purpose text,
+  start_time timestamptz not null,
+  end_time timestamptz not null,
+  status text not null default 'waiting'
+    check (status in ('waiting', 'notified', 'booked', 'cancelled')),
+  created_at timestamptz not null default now(),
+  check (end_time > start_time),
+  unique (facility_id, user_id, start_time, end_time)
 );
 
-create index if not exists posts_created_at_idx on public.posts (created_at desc);
-create index if not exists post_chunks_post_id_idx on public.post_chunks (post_id);
+create index waitlist_slot_idx
+  on public.waitlist (facility_id, start_time, end_time, created_at);
 
-alter table public.posts enable row level security;
-alter table public.post_chunks enable row level security;
+-- 4. Notifications
+create table public.notifications (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  booking_id uuid references public.bookings(id) on delete set null,
+  waitlist_id uuid references public.waitlist(id) on delete set null,
+  message text not null,
+  is_read boolean not null default false,
+  created_at timestamptz not null default now()
+);
 
-create policy "Anyone can read posts" on public.posts
-  for select to anon, authenticated using (true);
-create policy "Authors can create posts" on public.posts
-  for insert to authenticated with check ((select auth.uid()) = author_id);
-create policy "Authors can edit posts" on public.posts
-  for update to authenticated using ((select auth.uid()) = author_id)
-  with check ((select auth.uid()) = author_id);
-create policy "Authors can delete posts" on public.posts
-  for delete to authenticated using ((select auth.uid()) = author_id);
+create index notifications_user_created_idx
+  on public.notifications (user_id, created_at desc);
 
--- Embeddings are accessed only by the trusted FastAPI database connection.
-revoke all on public.post_chunks from anon, authenticated;
+-- Enable row-level security
+alter table public.facilities enable row level security;
+alter table public.bookings enable row level security;
+alter table public.waitlist enable row level security;
+alter table public.notifications enable row level security;
 
-insert into storage.buckets (id, name, public)
-values ('post-images', 'post-images', true)
-on conflict (id) do update set public = true;
+-- Facilities: anyone can see active facilities
+create policy "Anyone can view active facilities"
+  on public.facilities
+  for select to anon, authenticated
+  using (is_active = true);
 
--- Image writes happen through the FastAPI server with the service role key.
-create policy "Public post images" on storage.objects
-  for select to anon, authenticated using (bucket_id = 'post-images');
+-- Bookings: signed-in users can view confirmed bookings
+-- and their own cancelled bookings
+create policy "Users can view bookings"
+  on public.bookings
+  for select to authenticated
+  using (status = 'confirmed' or (select auth.uid()) = user_id);
+
+-- Users can create bookings only for themselves
+create policy "Users can create their own bookings"
+  on public.bookings
+  for insert to authenticated
+  with check ((select auth.uid()) = user_id);
+
+
+-- Waitlist: users can view and manage their own entries
+create policy "Users can view their own waitlist"
+  on public.waitlist
+  for select to authenticated
+  using ((select auth.uid()) = user_id);
+
+create policy "Users can join their own waitlist"
+  on public.waitlist
+  for insert to authenticated
+  with check ((select auth.uid()) = user_id);
+
+
+-- Notifications: users can only read and mark their own notifications
+create policy "Users can view their own notifications"
+  on public.notifications
+  for select to authenticated
+  using ((select auth.uid()) = user_id);
+
+
+-- Direct client writes to notifications are not permitted.
+revoke insert, delete on public.notifications from anon, authenticated;
 
